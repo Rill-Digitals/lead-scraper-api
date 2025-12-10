@@ -347,14 +347,33 @@ const scrapingTargets = [
 
 // ==================== SCRAPING FUNCTIONS ====================
 
+// Extract emails from HTML
 function extractEmails(html) {
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
   const emails = html.match(emailRegex) || [];
-  return [...new Set(emails)].filter(email => 
-    !email.includes('example.com') && 
-    !email.includes('test.com') &&
-    !email.includes('placeholder')
-  );
+  return [...new Set(emails)].filter(email => {
+    // Remove invalid patterns
+    if (email.includes('example.com')) return false;
+    if (email.includes('test.com')) return false;
+    if (email.includes('placeholder')) return false;
+    if (email.includes('noreply')) return false;
+    if (email.includes('privacy')) return false;
+    if (email.includes('support@')) return false;
+    
+    // Remove image/asset file extensions
+    if (email.includes('.png') || email.includes('.jpg') || 
+        email.includes('.jpeg') || email.includes('.gif') || 
+        email.includes('.svg') || email.includes('.webp') ||
+        email.includes('.ico') || email.includes('.css') ||
+        email.includes('.js') || email.includes('.woff')) return false;
+    
+    // Must have valid TLD (not just a file extension)
+    const validTLDs = ['com', 'net', 'org', 'edu', 'gov', 'mil', 'co', 'uk', 'ca', 'au', 'de', 'fr', 'jp', 'cn', 'in', 'br', 'io', 'ai', 'app', 'dev'];
+    const tld = email.split('.').pop().toLowerCase();
+    if (!validTLDs.includes(tld)) return false;
+    
+    return true;
+  });
 }
 
 function extractPhones(html) {
@@ -691,3 +710,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
