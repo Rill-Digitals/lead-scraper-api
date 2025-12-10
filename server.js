@@ -1,5 +1,5 @@
-// Automated Lead Scraper API
-// Scrapes websites automatically and stores leads with industry/location metadata
+// Automated Lead Scraper API - Google Sheets Version
+// Uses n8n + Google Sheets instead of database
 
 const express = require('express');
 const cors = require('cors');
@@ -13,8 +13,9 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory database (use MongoDB/PostgreSQL in production)
-let leadsDatabase = [];
+// n8n Webhook URLs (set these in Render environment variables)
+const N8N_SAVE_LEAD_WEBHOOK = process.env.N8N_SAVE_LEAD_WEBHOOK || 'https://n8n.rilldigitals.com/webhook/save-leads';
+const N8N_SEARCH_WEBHOOK = process.env.N8N_SEARCH_WEBHOOK || 'https://n8n.rilldigitals.com/webhook/search-leads';
 
 // ==================== SCRAPING TARGETS ====================
 // Comprehensive list of free business directories and sources
@@ -346,34 +347,27 @@ const scrapingTargets = [
 
 // ==================== SCRAPING FUNCTIONS ====================
 
-// Extract emails from HTML
 function extractEmails(html) {
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
   const emails = html.match(emailRegex) || [];
   return [...new Set(emails)].filter(email => 
     !email.includes('example.com') && 
     !email.includes('test.com') &&
-    !email.includes('placeholder') &&
-    !email.includes('noreply') &&
-    !email.includes('privacy') &&
-    !email.includes('support@')
+    !email.includes('placeholder')
   );
 }
 
-// Extract phone numbers
 function extractPhones(html) {
   const phoneRegex = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
   const phones = html.match(phoneRegex) || [];
   return [...new Set(phones)];
 }
 
-// Extract company names using common patterns
 function extractCompanyNames(html) {
   const $ = cheerio.load(html);
   const companies = [];
   
-  // Look for common company name patterns
-  $('h1, h2, h3, .company-name, .business-name, [itemprop="name"], .org, .organization').each((i, el) => {
+  $('h1, h2, h3, .company-name, .business-name, [itemprop="name"]').each((i, el) => {
     const text = $(el).text().trim();
     if (text && text.length < 100 && text.length > 3) {
       companies.push(text);
@@ -383,155 +377,99 @@ function extractCompanyNames(html) {
   return [...new Set(companies)].slice(0, 10);
 }
 
-// Extract names from HTML
-function extractNames(html) {
-  const $ = cheerio.load(html);
-  const names = [];
-  
-  $('[itemprop="author"], .author, .name, .contact-name').each((i, el) => {
-    const text = $(el).text().trim();
-    if (text && text.length < 50 && text.length > 3) {
-      names.push(text);
-    }
-  });
-  
-  return [...new Set(names)];
-}
-
-// Scrape a single URL
-async function scrapeURL(url, industry, location, sourceName = 'Unknown') {
+async function scrapeURL(url, industry, location) {
   try {
     console.log(`Scraping ${url}...`);
     
     const response = await axios.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
-      timeout: 15000,
-      maxRedirects: 5
+      timeout: 10000
     });
     
     const html = response.data;
     const emails = extractEmails(html);
     const phones = extractPhones(html);
     const companies = extractCompanyNames(html);
-    const names = extractNames(html);
     
     const leads = [];
     
-    // Create leads from emails
     emails.forEach((email, index) => {
       const lead = {
         id: `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         email: email,
-        name: names[index] || '',
+        name: '',
         company: companies[index] || '',
         phone: phones[index] || '',
         industry: industry,
         location: location,
         source: url,
-        sourceName: sourceName,
-        scrapedAt: new Date().toISOString(),
+        scraped_at: new Date().toISOString(),
         verified: false
       };
       leads.push(lead);
     });
     
-    console.log(`✓ Found ${leads.length} leads from ${url}`);
     return leads;
     
   } catch (error) {
-    if (error.response?.status === 403 || error.response?.status === 429) {
-      console.error(`⚠️  Access denied for ${url} - May require authentication or rate limited`);
-    } else {
-      console.error(`✗ Error scraping ${url}:`, error.message);
-    }
+    console.error(`Error scraping ${url}:`, error.message);
     return [];
   }
 }
 
-// Automated scraping job (runs periodically)
+// Save leads to Google Sheets via n8n
+async function saveLeadsToSheet(leads) {
+  if (!N8N_SAVE_LEAD_WEBHOOK) {
+    console.warn('N8N_SAVE_LEAD_WEBHOOK not configured');
+    return { success: false, saved: 0 };
+  }
+
+  try {
+    console.log(`Saving ${leads.length} leads to Google Sheets...`);
+    
+    // Send to n8n webhook
+    const response = await axios.post(N8N_SAVE_LEAD_WEBHOOK, {
+      leads: leads
+    });
+    
+    console.log(`✅ Saved ${leads.length} leads to Google Sheets`);
+    return { success: true, saved: leads.length };
+    
+  } catch (error) {
+    console.error('Error saving to sheets:', error.message);
+    return { success: false, saved: 0 };
+  }
+}
+
+// Automated scraping job
 async function runScrapingJob() {
-  console.log('🚀 Starting automated scraping job...');
-  console.log(`📋 Total targets: ${scrapingTargets.length}`);
+  console.log('🔍 Starting automated scraping job...');
   
-  let scrapedCount = 0;
-  let successCount = 0;
-  let failedCount = 0;
+  let totalLeads = 0;
   
   for (const target of scrapingTargets) {
-    // Skip targets that require authentication
-    if (target.requiresAuth) {
-      console.log(`⏭️  Skipping ${target.source} - requires authentication`);
-      continue;
-    }
-    
-    const leads = await scrapeURL(
-      target.url, 
-      target.industry, 
-      target.location,
-      target.source
-    );
+    const leads = await scrapeURL(target.url, target.industry, target.location);
     
     if (leads.length > 0) {
-      successCount++;
-      scrapedCount += leads.length;
-      
-      // Add to database, avoiding duplicates
-      leads.forEach(lead => {
-        const exists = leadsDatabase.find(l => l.email === lead.email);
-        if (!exists) {
-          leadsDatabase.push(lead);
-        }
-      });
-    } else {
-      failedCount++;
+      const result = await saveLeadsToSheet(leads);
+      totalLeads += result.saved;
     }
     
-    // Wait between requests to be respectful (2-5 seconds random delay)
-    const delay = 2000 + Math.random() * 3000;
-    await new Promise(resolve => setTimeout(resolve, delay));
+    // Wait between requests
+    await new Promise(resolve => setTimeout(resolve, 3000));
   }
   
-  console.log('✅ Scraping complete!');
-  console.log(`📊 Stats:`);
-  console.log(`   - Leads scraped: ${scrapedCount}`);
-  console.log(`   - Total leads in DB: ${leadsDatabase.length}`);
-  console.log(`   - Successful sources: ${successCount}`);
-  console.log(`   - Failed sources: ${failedCount}`);
+  console.log(`✅ Scraping complete. Saved ${totalLeads} new leads`);
 }
 
 // Schedule scraping job (every 6 hours)
-const SCRAPE_INTERVAL = 6 * 60 * 60 * 1000; // 6 hours
-setInterval(runScrapingJob, SCRAPE_INTERVAL);
+setInterval(runScrapingJob, 6 * 60 * 60 * 1000);
 
-// Run once on startup after 5 seconds
-setTimeout(runScrapingJob, 5000);
-
-// ==================== HELPER FUNCTIONS ====================
-
-function getTargetsByIndustry(industry) {
-  return scrapingTargets.filter(target => 
-    target.industry.toLowerCase() === industry.toLowerCase()
-  );
-}
-
-function getTargetsByLocation(location) {
-  return scrapingTargets.filter(target => 
-    target.location.toLowerCase().includes(location.toLowerCase())
-  );
-}
-
-function getTargetsBySource(source) {
-  return scrapingTargets.filter(target => 
-    target.source?.toLowerCase() === source.toLowerCase()
-  );
-}
+// Run once on startup (after 10 seconds)
+setTimeout(runScrapingJob, 10000);
 
 // ==================== API ROUTES ====================
 
@@ -539,46 +477,17 @@ function getTargetsBySource(source) {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
-    totalLeads: leadsDatabase.length,
-    totalTargets: scrapingTargets.length,
+    message: 'Lead Scraper API is running',
+    n8nConfigured: {
+      saveWebhook: !!N8N_SAVE_LEAD_WEBHOOK,
+      searchWebhook: !!N8N_SEARCH_WEBHOOK
+    },
     timestamp: new Date().toISOString() 
   });
 });
 
-// Welcome/Documentation endpoint
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Lead Scraper API',
-    version: '2.0.0',
-    description: 'Automated lead generation from 50+ free business directories',
-    endpoints: {
-      'POST /api/leads/search': 'Search leads by industry and location',
-      'GET /api/leads': 'Get all leads',
-      'GET /api/stats': 'Get database statistics',
-      'POST /api/scrape/trigger': 'Manually trigger scraping for a URL',
-      'POST /api/scrape/bulk': 'Bulk scrape multiple URLs',
-      'GET /api/scrape/targets': 'Get all scraping targets',
-      'POST /api/scrape/targets': 'Add a new scraping target',
-      'GET /api/leads/export/csv': 'Export leads as CSV',
-      'POST /api/leads/deduplicate': 'Remove duplicate leads',
-      'DELETE /api/leads/clear': 'Clear all leads (admin)'
-    },
-    sources: {
-      yellowPages: scrapingTargets.filter(t => t.source === 'YellowPages').length,
-      yelp: scrapingTargets.filter(t => t.source === 'Yelp').length,
-      linkedin: scrapingTargets.filter(t => t.source === 'LinkedIn').length,
-      crunchbase: scrapingTargets.filter(t => t.source === 'Crunchbase').length,
-      angelList: scrapingTargets.filter(t => t.source === 'AngelList').length,
-      productHunt: scrapingTargets.filter(t => t.source === 'Product Hunt').length,
-      industrySpecific: scrapingTargets.filter(t => 
-        !['YellowPages', 'Yelp', 'LinkedIn', 'Crunchbase', 'AngelList', 'Product Hunt'].includes(t.source)
-      ).length
-    }
-  });
-});
-
-// Search leads by industry and location
-app.post('/api/leads/search', (req, res) => {
+// Search leads (proxies to n8n which reads from Google Sheets)
+app.post('/api/leads/search', async (req, res) => {
   try {
     const { industry, location, leadCount } = req.body;
     
@@ -588,87 +497,40 @@ app.post('/api/leads/search', (req, res) => {
         error: 'Industry and location are required'
       });
     }
+
+    if (!N8N_SEARCH_WEBHOOK) {
+      return res.status(503).json({
+        success: false,
+        error: 'Search service not configured'
+      });
+    }
     
-    // Filter leads by industry and location
-    let filteredLeads = leadsDatabase.filter(lead => {
-      const industryMatch = industry === 'All' || 
-                           lead.industry.toLowerCase().includes(industry.toLowerCase());
-      const locationMatch = lead.location.toLowerCase().includes(location.toLowerCase());
-      return industryMatch && locationMatch;
+    // Forward request to n8n workflow
+    const response = await axios.post(N8N_SEARCH_WEBHOOK, {
+      industry,
+      location,
+      leadCount: parseInt(leadCount) || 50
     });
-    
-    // Limit results
-    const limit = parseInt(leadCount) || 50;
-    filteredLeads = filteredLeads.slice(0, limit);
     
     res.json({
       success: true,
-      count: filteredLeads.length,
-      query: { industry, location, limit },
-      data: filteredLeads
+      count: response.data.length || 0,
+      data: response.data || []
     });
     
   } catch (error) {
     console.error('Search error:', error);
     res.status(500).json({
       success: false,
-      error: 'Internal server error'
+      error: 'Search failed. Please try again.'
     });
   }
-});
-
-// Get all leads (admin)
-app.get('/api/leads', (req, res) => {
-  const { limit, offset } = req.query;
-  const limitNum = parseInt(limit) || 100;
-  const offsetNum = parseInt(offset) || 0;
-  
-  const paginatedLeads = leadsDatabase.slice(offsetNum, offsetNum + limitNum);
-  
-  res.json({
-    success: true,
-    total: leadsDatabase.length,
-    count: paginatedLeads.length,
-    limit: limitNum,
-    offset: offsetNum,
-    data: paginatedLeads
-  });
-});
-
-// Get leads statistics
-app.get('/api/stats', (req, res) => {
-  const stats = {
-    total: leadsDatabase.length,
-    byIndustry: {},
-    byLocation: {},
-    bySource: {},
-    verified: leadsDatabase.filter(l => l.verified).length,
-    recent: leadsDatabase.filter(l => {
-      const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-      return new Date(l.scrapedAt) > dayAgo;
-    }).length,
-    withPhone: leadsDatabase.filter(l => l.phone).length,
-    withCompany: leadsDatabase.filter(l => l.company).length,
-    withName: leadsDatabase.filter(l => l.name).length
-  };
-  
-  // Count by industry
-  leadsDatabase.forEach(lead => {
-    stats.byIndustry[lead.industry] = (stats.byIndustry[lead.industry] || 0) + 1;
-    stats.byLocation[lead.location] = (stats.byLocation[lead.location] || 0) + 1;
-    stats.bySource[lead.sourceName || 'Unknown'] = (stats.bySource[lead.sourceName || 'Unknown'] || 0) + 1;
-  });
-  
-  res.json({
-    success: true,
-    data: stats
-  });
 });
 
 // Manual scraping trigger
 app.post('/api/scrape/trigger', async (req, res) => {
   try {
-    const { url, industry, location, source } = req.body;
+    const { url, industry, location } = req.body;
     
     if (!url) {
       return res.status(400).json({
@@ -680,25 +542,15 @@ app.post('/api/scrape/trigger', async (req, res) => {
     const leads = await scrapeURL(
       url, 
       industry || 'Unknown', 
-      location || 'Unknown',
-      source || 'Manual'
+      location || 'Unknown'
     );
     
-    // Add to database
-    let addedCount = 0;
-    leads.forEach(lead => {
-      const exists = leadsDatabase.find(l => l.email === lead.email);
-      if (!exists) {
-        leadsDatabase.push(lead);
-        addedCount++;
-      }
-    });
+    const result = await saveLeadsToSheet(leads);
     
     res.json({
-      success: true,
+      success: result.success,
       scraped: leads.length,
-      added: addedCount,
-      duplicates: leads.length - addedCount,
+      saved: result.saved,
       data: leads
     });
     
@@ -714,7 +566,7 @@ app.post('/api/scrape/trigger', async (req, res) => {
 // Bulk scrape multiple URLs
 app.post('/api/scrape/bulk', async (req, res) => {
   try {
-    const { targets } = req.body; // Array of {url, industry, location, source}
+    const { targets } = req.body;
     
     if (!Array.isArray(targets)) {
       return res.status(400).json({
@@ -724,37 +576,22 @@ app.post('/api/scrape/bulk', async (req, res) => {
     }
     
     let totalScraped = 0;
-    let totalAdded = 0;
+    let totalSaved = 0;
     
     for (const target of targets) {
-      const leads = await scrapeURL(
-        target.url, 
-        target.industry, 
-        target.location,
-        target.source || 'Bulk'
-      );
+      const leads = await scrapeURL(target.url, target.industry, target.location);
+      const result = await saveLeadsToSheet(leads);
       
       totalScraped += leads.length;
+      totalSaved += result.saved;
       
-      leads.forEach(lead => {
-        const exists = leadsDatabase.find(l => l.email === lead.email);
-        if (!exists) {
-          leadsDatabase.push(lead);
-          totalAdded++;
-        }
-      });
-      
-      // Random delay between 2-5 seconds
-      const delay = 2000 + Math.random() * 3000;
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await new Promise(resolve => setTimeout(resolve, 3000));
     }
     
     res.json({
       success: true,
       scraped: totalScraped,
-      added: totalAdded,
-      duplicates: totalScraped - totalAdded,
-      totalLeads: leadsDatabase.length
+      saved: totalSaved
     });
     
   } catch (error) {
@@ -768,7 +605,7 @@ app.post('/api/scrape/bulk', async (req, res) => {
 
 // Add scraping target
 app.post('/api/scrape/targets', (req, res) => {
-  const { url, industry, location, source } = req.body;
+  const { url, industry, location } = req.body;
   
   if (!url || !industry || !location) {
     return res.status(400).json({
@@ -777,140 +614,80 @@ app.post('/api/scrape/targets', (req, res) => {
     });
   }
   
-  const newTarget = { 
-    url, 
-    industry, 
-    location, 
-    source: source || 'Custom',
-    addedAt: new Date().toISOString()
-  };
-  
-  scrapingTargets.push(newTarget);
+  scrapingTargets.push({ url, industry, location });
   
   res.json({
     success: true,
     message: 'Target added successfully',
-    target: newTarget,
     totalTargets: scrapingTargets.length
   });
 });
 
 // Get scraping targets
 app.get('/api/scrape/targets', (req, res) => {
-  const { industry, location, source } = req.query;
-  
-  let filtered = scrapingTargets;
-  
-  if (industry) {
-    filtered = filtered.filter(t => 
-      t.industry.toLowerCase().includes(industry.toLowerCase())
-    );
-  }
-  
-  if (location) {
-    filtered = filtered.filter(t => 
-      t.location.toLowerCase().includes(location.toLowerCase())
-    );
-  }
-  
-  if (source) {
-    filtered = filtered.filter(t => 
-      t.source?.toLowerCase().includes(source.toLowerCase())
-    );
-  }
-  
   res.json({
     success: true,
-    total: scrapingTargets.length,
-    filtered: filtered.length,
-    data: filtered
+    count: scrapingTargets.length,
+    data: scrapingTargets
   });
 });
 
-// Export leads as CSV
-app.get('/api/leads/export/csv', (req, res) => {
-  if (leadsDatabase.length === 0) {
-    return res.status(400).json({
-      success: false,
-      error: 'No leads to export'
-    });
-  }
+// Test n8n connection
+app.get('/api/test-n8n', async (req, res) => {
+  const tests = {
+    saveWebhook: false,
+    searchWebhook: false
+  };
   
-  const headers = ['Email', 'Name', 'Company', 'Phone', 'Industry', 'Location', 'Source', 'Source Name', 'Scraped At', 'Verified'];
-  const rows = leadsDatabase.map(lead => [
-    lead.email,
-    lead.name || '',
-    lead.company || '',
-    lead.phone || '',
-    lead.industry,
-    lead.location,
-    lead.source,
-    lead.sourceName || '',
-    lead.scrapedAt,
-    lead.verified ? 'Yes' : 'No'
-  ].map(val => `"${val}"`).join(','));
-  
-  const csv = [headers.join(','), ...rows].join('\n');
-  
-  res.setHeader('Content-Disposition', `attachment; filename=leads_${Date.now()}.csv`);
-  res.setHeader('Content-Type', 'text/csv');
-  res.send(csv);
-});
-
-// Delete duplicate leads
-app.post('/api/leads/deduplicate', (req, res) => {
-  const uniqueEmails = new Set();
-  const deduplicatedLeads = [];
-  
-  leadsDatabase.forEach(lead => {
-    if (!uniqueEmails.has(lead.email)) {
-      uniqueEmails.add(lead.email);
-      deduplicatedLeads.push(lead);
+  try {
+    if (N8N_SAVE_LEAD_WEBHOOK) {
+      const testLead = {
+        id: 'test_' + Date.now(),
+        email: 'test@example.com',
+        name: 'Test Lead',
+        company: 'Test Company',
+        industry: 'Technology',
+        location: 'Test Location',
+        scraped_at: new Date().toISOString()
+      };
+      
+      await axios.post(N8N_SAVE_LEAD_WEBHOOK, { leads: [testLead] });
+      tests.saveWebhook = true;
     }
-  });
+  } catch (error) {
+    console.error('Save webhook test failed:', error.message);
+  }
   
-  const removed = leadsDatabase.length - deduplicatedLeads.length;
-  leadsDatabase = deduplicatedLeads;
+  try {
+    if (N8N_SEARCH_WEBHOOK) {
+      await axios.post(N8N_SEARCH_WEBHOOK, {
+        industry: 'Technology',
+        location: 'USA',
+        leadCount: 5
+      });
+      tests.searchWebhook = true;
+    }
+  } catch (error) {
+    console.error('Search webhook test failed:', error.message);
+  }
   
   res.json({
     success: true,
-    removed: removed,
-    remaining: leadsDatabase.length
-  });
-});
-
-// Clear all leads (admin)
-app.delete('/api/leads/clear', (req, res) => {
-  const count = leadsDatabase.length;
-  leadsDatabase = [];
-  
-  res.json({
-    success: true,
-    message: `Cleared ${count} leads`
+    webhooksConfigured: {
+      save: !!N8N_SAVE_LEAD_WEBHOOK,
+      search: !!N8N_SEARCH_WEBHOOK
+    },
+    connectionTests: tests
   });
 });
 
 // Start server
 app.listen(PORT, () => {
-  console.log('═══════════════════════════════════════════════════');
-  console.log('🚀 Lead Scraper API v2.0');
-  console.log('═══════════════════════════════════════════════════');
-  console.log(`📡 Server running on port ${PORT}`);
-  console.log(`🌐 API URL: http://localhost:${PORT}`);
-  console.log(`📊 Dashboard: http://localhost:${PORT}/health`);
-  console.log(`🎯 Total scraping targets: ${scrapingTargets.length}`);
-  console.log('');
-  console.log('Sources breakdown:');
-  console.log(`  - YellowPages: ${scrapingTargets.filter(t => t.source === 'YellowPages').length}`);
-  console.log(`  - Yelp: ${scrapingTargets.filter(t => t.source === 'Yelp').length}`);
-  console.log(`  - Crunchbase: ${scrapingTargets.filter(t => t.source === 'Crunchbase').length}`);
-  console.log(`  - AngelList: ${scrapingTargets.filter(t => t.source === 'AngelList').length}`);
-  console.log(`  - Product Hunt: ${scrapingTargets.filter(t => t.source === 'Product Hunt').length}`);
-  console.log(`  - Industry Directories: ${scrapingTargets.filter(t => !['YellowPages', 'Yelp', 'Crunchbase', 'AngelList', 'Product Hunt', 'LinkedIn'].includes(t.source)).length}`);
-  console.log('');
-  console.log('🔍 Automated scraping will run every 6 hours');
-  console.log('⏰ First scrape starts in 5 seconds...');
-  console.log('═══════════════════════════════════════════════════');
+  console.log(`🚀 Lead Scraper API running on port ${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔗 n8n Save Webhook: ${N8N_SAVE_LEAD_WEBHOOK ? 'Configured ✅' : 'Not configured ⚠️'}`);
+  console.log(`🔍 n8n Search Webhook: ${N8N_SEARCH_WEBHOOK ? 'Configured ✅' : 'Not configured ⚠️'}`);
+  console.log(`⏰ Automated scraping will run every 6 hours`);
 });
 
 module.exports = app;
